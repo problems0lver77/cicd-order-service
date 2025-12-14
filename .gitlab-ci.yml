@@ -1,0 +1,173 @@
+stages:
+  - build
+  - checkstyle
+  - test
+  - coverage
+  - sonar
+  - docker
+  - security
+  - deploy
+
+default:
+  image: maven:3.9.3-eclipse-temurin-17
+  before_script:
+    - mvn -B --version
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .m2/repository
+      - target
+
+# ============================
+# Сборка проекта
+# ============================
+build:
+  stage: build
+  script:
+    - mvn -B clean compile
+  artifacts:
+    paths:
+      - target/
+    expire_in: 1 week
+  interruptible: true
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# ============================
+# Линтинг (Checkstyle)
+# ============================
+checkstyle:
+  stage: checkstyle
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - mvn checkstyle:check
+  artifacts:
+    paths:
+      - target/site/checkstyle
+    expire_in: 1 week
+  interruptible: true
+
+# ============================
+# Тесты
+# ============================
+test:
+  stage: test
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - mvn -B test
+  artifacts:
+    paths:
+      - target/jacoco.exec
+      - target/allure-results
+      - target/
+    expire_in: 1 week
+  interruptible: true
+
+# ============================
+# Покрытие (Jacoco)
+# ============================
+coverage:
+  stage: coverage
+  needs:
+    - job: test
+      artifacts: true
+  script:
+    - mvn verify
+  artifacts:
+    paths:
+      - target/site/jacoco
+    expire_in: 1 week
+  interruptible: true
+
+# ============================
+# SonarQube
+# ============================
+sonar:
+  stage: sonar
+  needs:
+    - job: test
+      artifacts: true
+  script:
+    - mvn sonar:sonar -Dsonar.projectKey=order-service -Dsonar.host.url=http://localhost:9000 -Dsonar.login=${SONAR_TOKEN}
+  allow_failure: true
+  interruptible: true
+
+# ============================
+# Docker сборка
+# ============================
+docker_build:
+  stage: docker
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - apk add --no-cache maven openjdk17
+    - mvn clean package -DskipTests
+    - docker login -u "gitlab-ci-token" -p "$CI_JOB_TOKEN" registry.gitlab.com
+    - docker build --pull --cache-from registry.gitlab.com/group/project:$CI_COMMIT_REF_NAME -t registry.gitlab.com/group/project:$CI_COMMIT_REF_NAME .
+    - docker push registry.gitlab.com/group/project:$CI_COMMIT_REF_NAME
+  cache:
+    key: docker-cache
+    paths:
+      - /var/lib/docker
+  interruptible: true
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# ============================
+# Security для Java
+# ============================
+security_java:
+  stage: security
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - mvn org.owasp:dependency-check-maven:check
+  artifacts:
+    paths:
+      - target/dependency-check-report.html
+    expire_in: 1 week
+  allow_failure: true
+  interruptible: true
+
+# ============================
+# Security для Docker
+# ============================
+docker_security_scan:
+  stage: security
+  image: aquasec/trivy:latest
+  needs:
+    - job: docker_build
+      artifacts: false
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL registry.gitlab.com/group/project:$CI_COMMIT_REF_NAME
+  allow_failure: true
+  artifacts:
+    paths:
+      - trivy-report.html
+    expire_in: 1 week
+  interruptible: true
+
+# ============================
+# Деплой
+# ============================
+deploy:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - job: docker_build
+      artifacts: false
+  script:
+    - echo "Deploying image registry.gitlab.com/group/project:$CI_COMMIT_REF_NAME to server"
+    # ssh deploy@server "docker pull registry.gitlab.com/group/project:$CI_COMMIT_REF_NAME && docker run -d ..."
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "prod"'
